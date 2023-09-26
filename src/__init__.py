@@ -1,5 +1,5 @@
 import random
-from datetime import datetime
+from datetime import datetime, timedelta
 import time
 import json
 import requests
@@ -53,36 +53,103 @@ TRACK_FILTERS = [
 ]
 
 
+CACHE_FILENAME = "latest_likes_cache.json"
+
+
+# FIXME FIXME  FIXME
+# - separate out super long tracks (like whole sets, and super short tracks like those that are only ~2 minutes long)
+
+
+def do_capture_tracks_from_url_list():
+    # all_likes = fetch_all_likes_cached(user_id=..., client_id=..., cache_filepath=..., output_cache_filepath=...)
+    # success, failed = capture_tracks_from_url_list(all_likes, url_list=..., capture_command=...)
+    ...
+
+
+def do_capture_latest_tracks(
+    user_id,
+    client_id,
+    all_likes_cache_filename,
+    latest_capture_filename,
+    capture_command="echo",
+):
+    # FIXME figure out consistent way of finding most recent all_likes_cache_filename
+    # - always write to same file, have the timestamped files as backup
+    # FIXME figure out better way of handling sc configs
+    # FIXME make resumable?
+    latest_captured_track = read_urls_file(latest_capture_filename)
+
+    all_likes = fetch_all_likes_cached(
+        user_id, client_id, all_likes_cache_filename, output_cache_filepath=None
+    )
+    success, failed = capture_latest_tracks(
+        all_likes, capture_command, latest_captured_track
+    )
+
+    new_latest_capture = ""
+    new_latest_capture_filename = ""
+    write_file(new_latest_capture_filename, new_latest_capture)
+
+
+def detect_free_tracks(likes):
+    free_fields = [
+        "title",
+        "permalink",
+        "permalink_url",
+        "purchase_title",
+        "tag_list",
+        "album_title",
+        "purchase_url",
+        "genre",
+        "artist",
+        "full_name",
+        "last_name",
+        "username",
+        "publisher",
+        "label_name"]
+
+    free_likes = list()
+    for like in likes:
+        tr = like['track']
+        for field in free_fields:
+            if "free" in (tr.get(field) or ""):
+                free_likes.append(like)
+                break
+
+    return free_likes
+
+
 def capture_tracks_from_url_list(all_likes, url_list, capture_command):
-    likes_to_capture, missing = url_list_to_tracks(url_list, all_likes)
+    def find_like_by_permalink(permalink):
+        return first(
+            [
+                like
+                for like in all_likes
+                if like["track"]["permalink_url"] == permalink
+            ],
+        )
+
+    def url_list_to_tracks(url_list):
+        tracks = []
+        missing = []
+        for url in url_list:
+            track = find_like_by_permalink(permalink=url)
+            if track:
+                tracks.append(track)
+            else:
+                missing.append(url)
+        return tracks, missing
+
+    likes_to_capture, missing = url_list_to_tracks(url_list)
     if missing:
         raise Exception(missing)
     return capture_tracks(likes_to_capture, capture_command)
 
 
-def url_list_to_tracks(url_list, all_likes):
-    tracks = []
-    missing = []
-    for url in url_list:
-        track = find_track_by_permalink(all_likes, url)
-        if track:
-            tracks.append(track)
-        else:
-            missing.append(url)
+def capture_latest_tracks(all_likes, capture_command, latest_captured_track):
 
-    return tracks, missing
-
-
-def find_track_by_permalink(all_likes, permalink):
-    return first(
-        [like for like in all_likes if like["track"]["permalink_url"] == permalink]
-    )
-
-
-def capture_latest_tracks(
-    all_likes, capture_command="echo", latest_captured_track=None
-):
     if latest_captured_track:
+        # FIXME latest_captured_track to use a url or title instead of json
         recent_likes = [
             like
             for like in all_likes
@@ -95,6 +162,10 @@ def capture_latest_tracks(
 
 
 def capture_tracks(likes_to_capture, capture_command="echo"):
+    def to_permalinks(likes):
+        return [like["track"]["permalink_url"] for like in likes]
+
+    time_before = datetime.now()
     print("Begin Capturing Tracks (%s total)" % len(likes_to_capture))
     success = []
     failed = []
@@ -110,56 +181,65 @@ def capture_tracks(likes_to_capture, capture_command="echo"):
         sleep_time = (like["track"]["duration"] / 1000) + 33
         print("Sleeping for", sleep_time, "seconds.")
         time.sleep(sleep_time)
-    print("Capture Completed (%s of %s successful)" % (len(success), len(likes_to_capture)))
+    print(
+        "Capture Completed (%s of %s successful)"
+        % (len(success), len(likes_to_capture))
+    )
     print("Successful:", to_permalinks(success))
     print("Failed:", to_permalinks(failed))
+    print("Total Time Taken:", datetime.now() - time_before)
     return success, failed
 
 
-def to_permalinks(likes):
-    return [like['track']['permalink_url'] for like in likes]
+def fetch_all_likes_cached(user_id, client_id, cache_dir):
+    def cache_file(cache_dir):
+        return os.path.join(cache_dir, CACHE_FILENAME)
 
+    def create_timestamped_filename(dirname, label):
+        timestamp_str = datetime.now().strftime("%Y-%m-%dT%H-%M")
+        return os.path.join(dirname, "%s-%s.json" % (timestamp_str, label))
 
-def fetch_all_likes_cached(
-    user_id, client_id, cache_filepath=None, output_filepath=None
-):
-    if (
-        cache_filepath
-        and os.path.exists(cache_filepath)
-        and os.path.isfile(cache_filepath)
-    ):
-        cached_likes = json_read_file(cache_filepath)
-    else:
+    def get_most_recent_like(likes):
+        if likes:
+            return sort_likes(likes)[0]
+        else:
+            return None
+
+    def track_id(like):
+        return like["track"]["id"]
+
+    try:
+        cached_likes = json_read_file(cache_file(cache_dir))
+    except FileNotFoundError:
         cached_likes = []
-    until_track = get_most_recent_liked_track(cached_likes)
-    new_likes = fetch_all_likes(user_id, client_id, until_track=until_track)
-    all_likes = sort_likes([*new_likes, *cached_likes])
-    output_filepath = output_filepath or create_timestamped_filename("likes-cache")
-    json_write_file(output_filepath, all_likes)
-    return all_likes, output_filepath
+    new_likes = fetch_all_likes(
+        user_id, client_id, until_track=get_most_recent_like(cached_likes)
+    )
+    cached_like_track_ids = [track_id(tr) for tr in cached_likes]
+    for nl in new_likes:
+        if not track_id(nl) in cached_like_track_ids:
+            cached_likes.append(nl)
+    all_likes = sort_likes(cached_likes)
+    json_write_file(cache_file(cache_dir), all_likes)
+    json_write_file(create_timestamped_filename(cache_dir, "likes-cache"), all_likes)
+    return all_likes
 
 
-def create_timestamped_filename(name):
-    timestamp_str = datetime.now().strftime("%Y-%m-%dT%H-%M")
-    return "%s-%s.json" % (timestamp_str, name)
-
-
-def filter_tracks(tracks):
+def remove_unrelevent_track_data(tracks):
     return dict_filter(TRACK_FILTERS, tracks)
 
 
-def get_most_recent_liked_track(tracks):
-    if tracks:
-        return sort_likes(tracks)[0]["track"]["id"]
-    else:
-        return None
-
-
-def sort_likes(tracks):
+def sort_likes(likes):
     """
     By liked date desc
     """
-    return sorted(tracks, key=lambda x: x["created_at"], reverse=True)
+
+    def parse_datetime(iso_date_string):
+        return datetime.fromisoformat(iso_date_string[:-1])
+
+    return sorted(
+        likes, key=lambda like: parse_datetime(like["created_at"]), reverse=True
+    )
 
 
 def dict_filter(filt, collection):
@@ -205,24 +285,63 @@ def first(lis):
 
 
 def fetch_all_likes(user_id, client_id, until_track=None, kindness_meter=3):
+    def like_created_at(like):
+        return like["created_at"]
+
+    def track_id(like):
+        return like["track"]["id"]
+
+    def permalink(like):
+        return like["track"]["permalink_url"]
+
+    def as_track_ids(likes):
+        return [track_id(like) for like in likes]
+
+    def as_permalinks(likes):
+        return [permalink(like) for like in likes]
+
+    def contains_until_track(collection):
+        if until_track:
+            return track_id(until_track) in as_track_ids(collection) or permalink(until_track) in as_permalinks(collection)
+        return False
+
+    def filter_already_seen_tracks(collection):
+        return [
+            like
+            for like in collection
+            if like_created_at(like) > like_created_at(until_track)
+        ]
+
+    def filter_undesireable(collection):
+        """
+        Songs that are too short, or too long.
+        """
+        too_short = timedelta(minutes=1, seconds=50)
+        too_long = timedelta(minutes=16)
+        get_duration = lambda like: timedelta(milliseconds=like['track']['full_duration'])
+        is_desireable = lambda like: get_duration(like) > too_short and get_duration(like) < too_long
+        keeping = [c for c in collection if is_desireable(c)]
+        filtered = [c for c in collection if not is_desireable(c)]
+        return keeping, filtered
+
     tracks = []
+    ignored_tracks = []
     next_href = f"https://api-v2.soundcloud.com/users/{user_id}/track_likes"
     while True and next_href:
         next_href, collection = do_fetch_likes(next_href, client_id)
-        if until_track and until_track in [like["track"]["id"] for like in collection]:
+        if contains_until_track(collection):
             next_href = None
-            until_date = [tr for tr in collection if tr["track"]["id"] == until_track][
-                0
-            ]["track"]["created_at"]
-            collection = [
-                tr for tr in collection if tr["track"]["created_at"] > until_date
-            ]
-            print("Until track found, exiting...", until_track)
-        tracks.extend(collection)
+
+            collection = filter_already_seen_tracks(collection)
+            print("Until track found, exiting...", permalink(until_track))
+        desireable, undesireable = filter_undesireable(collection)
+        tracks.extend(desireable)
+        ignored_tracks.extend(undesireable)
+        print("Fetching:", len(desireable), "Total:", len(tracks))
         time.sleep(kindness_meter)
-        print(next_href)
-        print(len(tracks))
-    return filter_tracks(tracks)
+    print("Desireable Tracks:", len(tracks))
+    print("Undesireable Tracks:", len(ignored_tracks), ignored_tracks)
+    return remove_unrelevent_track_data(tracks)
 
 
 def do_fetch_likes(url, client_id, limit=100):
@@ -236,14 +355,11 @@ def do_fetch_likes(url, client_id, limit=100):
 
 
 def json_read_file(filename):
-    with open(filename, "r") as f:
-        data = json.loads(f.read())
-    return data
+    return json.loads(read_file(filename))
 
 
 def json_write_file(filename, data):
-    with open(filename, "w") as f:
-        f.write(json.dumps(data))
+    write_file(filename, json.dumps(data))
 
 
 def json_append_file(filename, new_data):
@@ -258,7 +374,29 @@ def json_append_file(filename, new_data):
     json_write_file(filename, [*existing_data, *new_data])
 
 
+def read_urls_file(filename):
+    return filter_falsy(read_file(filename).split("\n"))
+
+
+def write_urls_file(filename, data_list):
+    return write_file(filename, "\n".join(data_list))
+
+
 def read_file(filename):
-    with open(filename, "r") as f:
-        data = f.read().split("\n")
-    return [d for d in data if d]
+    with open(absolute_path(filename), "r") as f:
+        data = f.read()
+    return data
+
+
+def write_file(filename, data):
+    os.makedirs(os.path.dirname(absolute_path(filename)), exist_ok=True)
+    with open(filename, "w") as f:
+        f.write(data)
+
+
+def absolute_path(filename):
+    return os.path.abspath(os.path.expanduser(filename))
+
+
+def filter_falsy(lis):
+    return [item for item in lis if item]
